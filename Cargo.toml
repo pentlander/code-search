@@ -1,0 +1,56 @@
+[package]
+name = "code-search"
+edition = "2021"
+
+[dependencies]
+# Tree-sitter core
+tree-sitter = "0.25"
+
+# Tree-sitter grammars (22 languages)
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-kotlin-ng = "1"
+tree-sitter-ruby = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-lua = "0.5"
+tree-sitter-bash = "0.25"
+tree-sitter-scala = "0.25"
+tree-sitter-php = "0.24"
+tree-sitter-zig = "1"
+tree-sitter-elixir = "0.3"
+tree-sitter-dart = "0.1"
+tree-sitter-ocaml = "0.24"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-hcl = "1"
+
+# MLX GPU embedding
+mlx-rs = { git = "https://github.com/oxideai/mlx-rs", rev = "fc41a8fa" }
+mlx-macros = { git = "https://github.com/oxideai/mlx-rs", rev = "fc41a8fa" }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+# SQLite + vector search
+rusqlite = { version = "0.32", features = ["bundled"] }
+simsimd = "6.5"
+bytemuck = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# File walking (gitignore-aware, by burntsushi)
+ignore = "0.4"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Regex for name pattern filtering
+regex = "1"
