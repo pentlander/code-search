@@ -54,3 +54,4 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # Regex for name pattern filtering
 regex = "1"
+tree-sitter-proto = "0.4"
