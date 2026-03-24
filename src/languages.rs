@@ -66,6 +66,8 @@ static EXTENSION_MAP: &[(&str, LanguageInfo)] = &[
     (".yaml", LanguageInfo { grammar: "yaml", name: "YAML" }),
     // TOML
     (".toml", LanguageInfo { grammar: "toml", name: "TOML" }),
+    // Protobuf
+    (".proto", LanguageInfo { grammar: "proto", name: "Protobuf" }),
     // HCL / Terraform
     (".hcl", LanguageInfo { grammar: "hcl", name: "HCL" }),
     (".tf", LanguageInfo { grammar: "terraform", name: "Terraform" }),
@@ -110,6 +112,7 @@ pub fn load_language(grammar: &str) -> Option<Language> {
         "ocaml" => Some(tree_sitter_ocaml::LANGUAGE_OCAML.into()),
         "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
         "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
+        "proto" => Some(tree_sitter_proto::LANGUAGE.into()),
         "hcl" => Some(tree_sitter_hcl::LANGUAGE.into()),
         "terraform" => Some(tree_sitter_hcl::LANGUAGE.into()),
         _ => None,

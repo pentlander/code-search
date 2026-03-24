@@ -166,6 +166,7 @@ fn get_spec(grammar: &str) -> Option<&'static LanguageSpec> {
         "ocaml" => Some(&OCAML_SPEC),
         "yaml" => Some(&YAML_SPEC),
         "toml" => Some(&TOML_SPEC),
+        "proto" => Some(&PROTO_SPEC),
         "hcl" => Some(&HCL_SPEC),
         "terraform" => Some(&TERRAFORM_SPEC),
         _ => None,
@@ -966,6 +967,74 @@ static TOML_SPEC: LanguageSpec = LanguageSpec {
     get_signature: |_, _| None,
     resolve_kind: |_, kind| kind,
     is_container: |t| matches!(t, "table" | "table_array_element"),
+};
+
+// ─── Protobuf ──────────────────────────────────────────────────────────
+
+fn proto_node_kind(node_type: &str) -> Option<SymbolKind> {
+    match node_type {
+        "message" => Some(SymbolKind::Struct),
+        "enum" => Some(SymbolKind::Enum),
+        "service" => Some(SymbolKind::Interface),
+        "rpc" => Some(SymbolKind::Method),
+        "field" | "map_field" => Some(SymbolKind::Property),
+        "oneof" => Some(SymbolKind::Property),
+        "package" => Some(SymbolKind::Module),
+        _ => None,
+    }
+}
+
+fn proto_get_name(node: Node, _kind: SymbolKind, source: &[u8]) -> Option<String> {
+    let nk = node.kind();
+    match nk {
+        "message" => first_child_of_type(node, "message_name").map(|n| node_text(n, source).to_string()),
+        "enum" => first_child_of_type(node, "enum_name").map(|n| node_text(n, source).to_string()),
+        "service" => first_child_of_type(node, "service_name").map(|n| node_text(n, source).to_string()),
+        "rpc" => first_child_of_type(node, "rpc_name").map(|n| node_text(n, source).to_string()),
+        "package" => first_child_of_type(node, "full_ident").map(|n| node_text(n, source).to_string()),
+        "field" | "map_field" | "oneof" => {
+            // Fields have identifier children — find the field name
+            first_child_of_type(node, "identifier").map(|n| node_text(n, source).to_string())
+        }
+        _ => None,
+    }
+}
+
+fn proto_get_signature(node: Node, source: &[u8]) -> Option<String> {
+    let nk = node.kind();
+    match nk {
+        "rpc" => {
+            // rpc Name(Request) returns (Response)
+            Some(extract_signature_line(node, source).unwrap_or_default())
+        }
+        "field" => {
+            // type name = number;
+            let type_node = first_child_of_type(node, "type").map(|n| node_text(n, source)).unwrap_or("");
+            let name = first_child_of_type(node, "identifier").map(|n| node_text(n, source)).unwrap_or("");
+            let num = first_child_of_type(node, "field_number").map(|n| node_text(n, source)).unwrap_or("");
+            Some(format!("{} {} = {}", type_node, name, num))
+        }
+        "map_field" => {
+            let key = first_child_of_type(node, "key_type").map(|n| node_text(n, source)).unwrap_or("");
+            let val = first_child_of_type(node, "type").map(|n| node_text(n, source)).unwrap_or("");
+            let name = first_child_of_type(node, "identifier").map(|n| node_text(n, source)).unwrap_or("");
+            let num = first_child_of_type(node, "field_number").map(|n| node_text(n, source)).unwrap_or("");
+            Some(format!("map<{}, {}> {} = {}", key, val, name, num))
+        }
+        _ => None,
+    }
+}
+
+fn proto_is_container(node_type: &str) -> bool {
+    matches!(node_type, "message" | "enum" | "service")
+}
+
+static PROTO_SPEC: LanguageSpec = LanguageSpec {
+    node_kind: proto_node_kind,
+    get_name: proto_get_name,
+    get_signature: proto_get_signature,
+    resolve_kind: |_, kind| kind,
+    is_container: proto_is_container,
 };
 
 // ─── HCL / Terraform ──────────────────────────────────────────────────
