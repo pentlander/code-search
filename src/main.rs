@@ -574,6 +574,10 @@ fn cmd_navigate(
     Ok(())
 }
 
+/// A name search filters its own output and skips files without the name
+/// before parsing, so it can scan far more than an unfiltered outline.
+const FIND_IDENTS_MAX_FILES: usize = 100_000;
+
 fn cmd_find_idents(
     name: &str,
     path: &str,
@@ -595,7 +599,7 @@ fn cmd_find_idents(
     };
 
     let (files, skipped) = if abs_path.is_dir() {
-        let result = collect_files(&abs_path, 200);
+        let result = collect_files(&abs_path, FIND_IDENTS_MAX_FILES);
         (result.found, result.skipped)
     } else {
         (vec![abs_path.clone()], 0)
@@ -606,6 +610,13 @@ fn cmd_find_idents(
     let mut total = 0;
     let mut file_count = 0;
     for file in &files {
+        // Most files cannot contain the name; skip them before parsing.
+        if !single_file
+            && !std::fs::read(file)
+                .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(name))
+        {
+            continue;
+        }
         let parsed = match parser_cache.parse_file(file) {
             Ok(p) => p,
             // An explicitly named file must parse; directory scans skip what they cannot.
@@ -680,10 +691,11 @@ fn cmd_find_idents(
     }
     if skipped > 0 {
         eprintln!(
-            "[Scanned {} of {} files. {} skipped (limit: 200)]",
+            "[Scanned {} of {} files. {} skipped (limit: {})]",
             files.len(),
             files.len() + skipped,
-            skipped
+            skipped,
+            FIND_IDENTS_MAX_FILES
         );
     }
     Ok(())
