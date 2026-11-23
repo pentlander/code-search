@@ -8,11 +8,10 @@ use clap::{Parser as ClapParser, Subcommand};
 use code_search::db::SearchDB;
 use code_search::indexer;
 use code_search::model::Embedder;
+use code_search::nav::{self, Categories, InspectOptions, InspectTarget, Role};
 use code_search::parser::ParserCache;
 use code_search::search::multi_query_search;
-use code_search::symbols::{
-    self, extract_symbols, format_outline, format_symbols, ExtractOptions,
-};
+use code_search::symbols::{extract_symbols, format_outline, format_symbols, ExtractOptions};
 use code_search::walker::collect_files;
 
 const CACHE_DIR: &str = ".code-search-cache";
@@ -82,9 +81,31 @@ enum Commands {
         /// File or directory path to analyze
         path: String,
 
-        /// Output format: "outline" or "symbols"
-        #[arg(long, default_value = "outline")]
+        /// "outline" (tree), "symbols" (flat list), "inspect" (inside one
+        /// symbol) or "scope" (enclosing symbols at a line)
+        #[arg(long, default_value = "outline",
+              value_parser = ["outline", "symbols", "inspect", "scope"])]
         action: String,
+
+        /// 1-based line: required for scope; selects the symbol for inspect
+        #[arg(long)]
+        line: Option<usize>,
+
+        /// 1-based column on --line, for an exact position
+        #[arg(long, requires = "line")]
+        column: Option<usize>,
+
+        /// Symbol to inspect, optionally qualified ("Type::method" or "Type.method")
+        #[arg(long, conflicts_with = "line")]
+        symbol: Option<String>,
+
+        /// Inspect: maximum nesting depth of reported items
+        #[arg(long)]
+        depth: Option<usize>,
+
+        /// Inspect: comma-separated categories (control_flow, calls, locals, nested_symbols)
+        #[arg(long)]
+        include: Option<String>,
 
         /// Filter by symbol kind
         #[arg(long)]
@@ -114,6 +135,10 @@ enum Commands {
         /// Lines of context around each match
         #[arg(long, default_value = "0")]
         context: usize,
+
+        /// Only report this syntactic role
+        #[arg(long, value_parser = Role::ALL)]
+        role: Option<String>,
 
         /// Output as JSON
         #[arg(long)]
@@ -338,16 +363,49 @@ fn cmd_search(
     Ok(())
 }
 
+/// Flags that only `inspect` and `scope` take.
+struct NavArgs<'a> {
+    line: Option<usize>,
+    column: Option<usize>,
+    symbol: Option<&'a str>,
+    depth: Option<usize>,
+    include: Option<&'a str>,
+}
+
+impl NavArgs<'_> {
+    fn any(&self) -> bool {
+        self.line.is_some()
+            || self.column.is_some()
+            || self.symbol.is_some()
+            || self.depth.is_some()
+            || self.include.is_some()
+    }
+}
+
 fn cmd_symbols(
     path: &str,
     action: &str,
     kind: Option<&str>,
     name_pattern: Option<&str>,
     signatures: bool,
+    nav_args: NavArgs,
     _json: bool,
 ) -> Result<(), String> {
-    let abs_path = std::fs::canonicalize(path)
-        .map_err(|e| format!("Path not found: {}: {}", path, e))?;
+    let abs_path =
+        std::fs::canonicalize(path).map_err(|e| format!("Path not found: {}: {}", path, e))?;
+
+    if action == "inspect" || action == "scope" {
+        if kind.is_some() || name_pattern.is_some() {
+            return Err("--kind and --name-pattern apply only to outline and symbols".to_string());
+        }
+        return cmd_navigate(path, &abs_path, action, signatures, &nav_args);
+    }
+    if nav_args.any() {
+        return Err(
+            "--line, --column, --symbol, --depth and --include apply only to inspect and scope"
+                .to_string(),
+        );
+    }
 
     let mut parser_cache = ParserCache::new();
 
@@ -461,99 +519,178 @@ fn cmd_symbols(
     Ok(())
 }
 
-fn cmd_find_idents(name: &str, path: &str, context: usize, _json: bool) -> Result<(), String> {
-    let abs_path = std::fs::canonicalize(path)
-        .map_err(|e| format!("Path not found: {}: {}", path, e))?;
+fn cmd_navigate(
+    path: &str,
+    abs_path: &Path,
+    action: &str,
+    signatures: bool,
+    args: &NavArgs,
+) -> Result<(), String> {
+    if abs_path.is_dir() {
+        return Err(format!(
+            "{} needs a file, not a directory: {}",
+            action, path
+        ));
+    }
+    let mut parser_cache = ParserCache::new();
+    let parsed = parser_cache.parse_file(abs_path)?;
+    let grammar = parsed.language.grammar;
+
+    let output = if action == "scope" {
+        if args.symbol.is_some() || args.depth.is_some() || args.include.is_some() {
+            return Err("scope takes only --line and --column".to_string());
+        }
+        let line = args.line.ok_or("scope needs --line")?;
+        nav::scope(
+            &parsed.tree,
+            grammar,
+            &parsed.source,
+            line,
+            args.column,
+            signatures,
+        )?
+    } else {
+        let target = match (args.line, args.symbol) {
+            (Some(line), None) => InspectTarget::Line {
+                line,
+                column: args.column,
+            },
+            (None, Some(symbol)) => InspectTarget::Symbol(symbol),
+            _ => return Err("inspect needs exactly one of --line or --symbol".to_string()),
+        };
+        let include = match args.include {
+            Some(list) => Categories::parse(list)?,
+            None => Categories::all(),
+        };
+        nav::inspect(
+            &parsed.tree,
+            grammar,
+            &parsed.source,
+            path,
+            target,
+            &InspectOptions {
+                depth: args.depth.unwrap_or(3),
+                include,
+                signatures,
+            },
+        )?
+    };
+    println!("{}", truncate_output(&output));
+    Ok(())
+}
+
+fn cmd_find_idents(
+    name: &str,
+    path: &str,
+    context: usize,
+    role: Option<&str>,
+    _json: bool,
+) -> Result<(), String> {
+    let role = role.and_then(Role::parse);
+    let abs_path =
+        std::fs::canonicalize(path).map_err(|e| format!("Path not found: {}: {}", path, e))?;
 
     let mut parser_cache = ParserCache::new();
     let cwd = std::env::current_dir().unwrap_or_else(|_| abs_path.clone());
-    let mut all_matches = Vec::new();
-
-    let metadata = std::fs::metadata(&abs_path)
-        .map_err(|e| format!("Cannot stat {}: {}", path, e))?;
-
-    if metadata.is_dir() {
-        let result = collect_files(&abs_path, 200);
-        for file in &result.found {
-            match parser_cache.parse_file(file) {
-                Ok(parse_result) => {
-                    let rel_path = file
-                        .strip_prefix(&cwd)
-                        .unwrap_or(file)
-                        .to_string_lossy()
-                        .to_string();
-                    let matches = symbols::find_identifiers_in_tree(
-                        &parse_result.tree,
-                        name,
-                        &parse_result.source,
-                        &rel_path,
-                    );
-                    all_matches.extend(matches);
-                }
-                Err(_) => continue,
-            }
-        }
-    } else {
-        let parse_result = parser_cache.parse_file(&abs_path)?;
-        let rel_path = abs_path
-            .strip_prefix(&cwd)
-            .unwrap_or(&abs_path)
+    let rel = |file: &Path| {
+        file.strip_prefix(&cwd)
+            .unwrap_or(file)
             .to_string_lossy()
-            .to_string();
-        let matches = symbols::find_identifiers_in_tree(
-            &parse_result.tree,
-            name,
-            &parse_result.source,
-            &rel_path,
-        );
-        all_matches.extend(matches);
-    }
+            .to_string()
+    };
 
-    if all_matches.is_empty() {
-        println!("No occurrences of \"{}\" found in {}", name, path);
-        return Ok(());
-    }
+    let (files, skipped) = if abs_path.is_dir() {
+        let result = collect_files(&abs_path, 200);
+        (result.found, result.skipped)
+    } else {
+        (vec![abs_path.clone()], 0)
+    };
+    let single_file = !abs_path.is_dir();
 
     let mut lines = Vec::new();
-    let mut current_file = String::new();
-    for m in &all_matches {
-        if m.file != current_file {
-            if !current_file.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push(m.file.clone());
-            current_file = m.file.clone();
+    let mut total = 0;
+    let mut file_count = 0;
+    for file in &files {
+        let parsed = match parser_cache.parse_file(file) {
+            Ok(p) => p,
+            // An explicitly named file must parse; directory scans skip what they cannot.
+            Err(e) if single_file => return Err(e),
+            Err(_) => continue,
+        };
+        if parsed.language.grammar == "markdown" {
+            continue;
         }
-
-        if context > 0 {
-            let start_line = m.line.saturating_sub(context + 1);
-            let end_line = (m.line + context).min(m.source_lines.len());
-            if lines.last().map_or(false, |l| l != &m.file) {
+        let hits: Vec<nav::IdentMatch> =
+            nav::find_identifiers(&parsed.tree, parsed.language.grammar, &parsed.source, name)
+                .into_iter()
+                .filter(|m| role.is_none_or(|r| m.role == r))
+                .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        let source_lines: Vec<&str> = parsed.source.lines().collect();
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(rel(file));
+        for (i, m) in hits.iter().enumerate() {
+            let tag = match &m.scope {
+                Some(scope) => format!("[{} in {}]", m.role.as_str(), scope),
+                None => format!("[{}]", m.role.as_str()),
+            };
+            if context == 0 {
+                let text = source_lines.get(m.line - 1).map(|l| l.trim()).unwrap_or("");
+                lines.push(format!("  {}:{}  {}  {}", m.line, m.col, tag, text));
+                continue;
+            }
+            if i > 0 {
                 lines.push("  --".to_string());
             }
-            for i in start_line..end_line {
-                let line_num = i + 1;
-                let marker = if line_num == m.line { ">" } else { " " };
-                let line_text = m.source_lines.get(i).map(|l| l.trim_end()).unwrap_or("");
-                lines.push(format!("{} {}:  {}", marker, line_num, line_text));
+            lines.push(format!("  {}:{}  {}", m.line, m.col, tag));
+            let first = m.line.saturating_sub(context).max(1);
+            let last = (m.line + context).min(source_lines.len());
+            for n in first..=last {
+                let marker = if n == m.line { ">" } else { " " };
+                let text = source_lines.get(n - 1).map(|l| l.trim_end()).unwrap_or("");
+                lines.push(format!("{} {}:  {}", marker, n, text));
             }
-        } else {
-            lines.push(format!("  {}:{}  {}", m.line, m.col, m.line_text));
         }
+        total += hits.len();
+        file_count += 1;
     }
 
-    let output = lines.join("\n");
-    let truncated = truncate_output(&output);
-    println!("{}", truncated);
-
-    let file_count: std::collections::HashSet<&str> =
-        all_matches.iter().map(|m| m.file.as_str()).collect();
-    eprintln!(
-        "{} occurrences across {} files",
-        all_matches.len(),
-        file_count.len()
-    );
-
+    let role_note = role
+        .map(|r| format!(" with role {}", r.as_str()))
+        .unwrap_or_default();
+    if total == 0 {
+        println!(
+            "No occurrences of \"{}\"{} found in {}",
+            name, role_note, path
+        );
+    } else {
+        println!("{}", truncate_output(&lines.join("\n")));
+        eprintln!(
+            "{} {} across {} {}{}",
+            total,
+            if total == 1 {
+                "occurrence"
+            } else {
+                "occurrences"
+            },
+            file_count,
+            if file_count == 1 { "file" } else { "files" },
+            role.map(|r| format!(" (role: {})", r.as_str()))
+                .unwrap_or_default()
+        );
+    }
+    if skipped > 0 {
+        eprintln!(
+            "[Scanned {} of {} files. {} skipped (limit: 200)]",
+            files.len(),
+            files.len() + skipped,
+            skipped
+        );
+    }
     Ok(())
 }
 
@@ -606,6 +743,11 @@ fn main() {
         Commands::Symbols {
             path,
             action,
+            line,
+            column,
+            symbol,
+            depth,
+            include,
             kind,
             name_pattern,
             signatures,
@@ -616,14 +758,22 @@ fn main() {
             kind.as_deref(),
             name_pattern.as_deref(),
             signatures,
+            NavArgs {
+                line,
+                column,
+                symbol: symbol.as_deref(),
+                depth,
+                include: include.as_deref(),
+            },
             json,
         ),
         Commands::FindIdents {
             name,
             path,
             context,
+            role,
             json,
-        } => cmd_find_idents(&name, &path, context, json),
+        } => cmd_find_idents(&name, &path, context, role.as_deref(), json),
         Commands::Stats { path } => cmd_stats(&path),
     };
 

@@ -4,7 +4,6 @@
 //! with their names, kinds, line ranges, nesting, and optional signatures.
 
 use regex::Regex;
-use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
 
 // ─── Types ─────────────────────────────────────────────────────────────
@@ -30,6 +29,7 @@ pub enum SymbolKind {
     Provider,
     Output,
     Locals,
+    Section,
 }
 
 impl SymbolKind {
@@ -54,6 +54,7 @@ impl SymbolKind {
             Self::Provider => "provider",
             Self::Output => "output",
             Self::Locals => "locals",
+            Self::Section => "section",
         }
     }
 
@@ -78,6 +79,7 @@ impl SymbolKind {
             Self::Provider => "provider",
             Self::Output => "output",
             Self::Locals => "locals",
+            Self::Section => "section",
         }
     }
 
@@ -99,6 +101,10 @@ impl SymbolKind {
             "block" => Some(Self::Block),
             "resource" => Some(Self::Resource),
             "data" => Some(Self::Data),
+            "provider" => Some(Self::Provider),
+            "output" => Some(Self::Output),
+            "locals" => Some(Self::Locals),
+            "section" => Some(Self::Section),
             _ => None,
         }
     }
@@ -169,6 +175,7 @@ fn get_spec(grammar: &str) -> Option<&'static LanguageSpec> {
         "proto" => Some(&PROTO_SPEC),
         "hcl" => Some(&HCL_SPEC),
         "terraform" => Some(&TERRAFORM_SPEC),
+        "markdown" => Some(&MARKDOWN_SPEC),
         _ => None,
     }
 }
@@ -194,6 +201,94 @@ fn first_child_of_type<'a>(node: Node<'a>, type_name: &str) -> Option<Node<'a>> 
 
 fn node_text<'a>(node: Node<'a>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
+}
+
+/// Shorten `text` to at most `max` bytes, ending in "..." when cut.
+/// Cuts on a char boundary, so multi-byte names never panic.
+pub fn truncate_display(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut cut = max.saturating_sub(3);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &text[..cut])
+}
+
+/// 1-based inclusive line range of a node. A node whose end sits at column 0
+/// of a later row (it swallowed a trailing newline) ends on the previous line.
+pub fn line_range(node: Node) -> (usize, usize) {
+    let start = node.start_position();
+    let end = node.end_position();
+    let end_line = if end.column == 0 && end.row > start.row {
+        end.row
+    } else {
+        end.row + 1
+    };
+    (start.row + 1, end_line)
+}
+
+/// A symbol recognized at a single AST node, named and kinded as the outline shows it.
+pub struct NodeSymbol<'a> {
+    /// The node the language spec recognized.
+    pub node: Node<'a>,
+    /// The node whose lines the outline reports: an enclosing `export` or decorator wrapper.
+    pub range_node: Node<'a>,
+    pub name: String,
+    pub kind: SymbolKind,
+}
+
+/// Recognize the symbol a node defines, if any. Python decorator wrappers return
+/// `None`; their inner definition carries the symbol and is widened to cover them.
+pub fn node_symbol<'a>(node: Node<'a>, grammar: &str, source: &[u8]) -> Option<NodeSymbol<'a>> {
+    let spec = get_spec(grammar)?;
+    if node.kind() == "decorated_definition" {
+        return None;
+    }
+    let raw = (spec.node_kind)(node.kind())?;
+    let kind = (spec.resolve_kind)(node, raw);
+    let name = truncate_display(&(spec.get_name)(node, kind, source)?, 80);
+    let kind = if grammar == "hcl" || grammar == "terraform" {
+        map_hcl_kind(kind, &name)
+    } else {
+        kind
+    };
+    Some(NodeSymbol {
+        node,
+        range_node: range_owner(node),
+        name,
+        kind,
+    })
+}
+
+/// Signature for a symbol node, truncated the way the outline truncates it.
+pub fn node_signature(node: Node, grammar: &str, source: &[u8]) -> Option<String> {
+    let spec = get_spec(grammar)?;
+    let owner = range_owner(node);
+    let target = if owner.kind() == "decorated_definition" {
+        owner
+    } else {
+        node
+    };
+    (spec.get_signature)(target, source).map(|s| truncate_display(&s, 120))
+}
+
+/// The node whose range the outline reports for a symbol node.
+fn range_owner(node: Node) -> Node {
+    if let Some(parent) = node.parent() {
+        let wraps = match parent.kind() {
+            "export_statement" | "export_declaration" => {
+                parent.child_by_field_name("declaration") == Some(node)
+            }
+            "decorated_definition" => parent.child_by_field_name("definition") == Some(node),
+            _ => false,
+        };
+        if wraps {
+            return parent;
+        }
+    }
+    node
 }
 
 fn is_inside_class(node: Node) -> bool {
@@ -1101,6 +1196,45 @@ static TERRAFORM_SPEC: LanguageSpec = LanguageSpec {
     is_container: |t| t == "block",
 };
 
+// ─── Markdown ──────────────────────────────────────────────────────────
+//
+// tree-sitter-md nests a `section` node per heading, with deeper headings as
+// child sections. Text before the first heading sits in a section with no
+// heading; that section is not a symbol, and the walk looks through it.
+
+fn markdown_node_kind(node_type: &str) -> Option<SymbolKind> {
+    match node_type {
+        "section" => Some(SymbolKind::Section),
+        _ => None,
+    }
+}
+
+fn markdown_get_name(node: Node, _kind: SymbolKind, source: &[u8]) -> Option<String> {
+    let heading = (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .find(|c| matches!(c.kind(), "atx_heading" | "setext_heading"))?;
+    let raw = heading
+        .child_by_field_name("heading_content")
+        .map(|n| node_text(n, source))
+        .unwrap_or_else(|| node_text(heading, source).trim_start_matches('#'));
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // ATX headings may close with a run of '#'.
+    let name = collapsed.trim_end_matches('#').trim_end();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+static MARKDOWN_SPEC: LanguageSpec = LanguageSpec {
+    node_kind: markdown_node_kind,
+    get_name: markdown_get_name,
+    get_signature: |_, _| None,
+    resolve_kind: |_, kind| kind,
+    is_container: |t| t == "section",
+};
+
 // ─── Symbol extraction ─────────────────────────────────────────────────
 
 /// Extract symbols from a parsed tree.
@@ -1170,12 +1304,8 @@ fn walk_node(
 
         if let Some(raw_kind) = (spec.node_kind)(child.kind()) {
             let kind = (spec.resolve_kind)(child, raw_kind);
-            if let Some(mut name) = (spec.get_name)(child, kind, source) {
-                // Truncate long names
-                if name.len() > 80 {
-                    name.truncate(77);
-                    name.push_str("...");
-                }
+            if let Some(name) = (spec.get_name)(child, kind, source) {
+                let name = truncate_display(&name, 80);
 
                 // Map HCL block kinds
                 let final_kind = if grammar == "hcl" || grammar == "terraform" {
@@ -1184,25 +1314,19 @@ fn walk_node(
                     kind
                 };
 
+                let (start_line, end_line) = line_range(child);
                 let mut symbol = SymbolInfo {
                     name,
                     kind: final_kind,
-                    start_line: child.start_position().row + 1,
-                    end_line: child.end_position().row + 1,
+                    start_line,
+                    end_line,
                     signature: None,
                     children: Vec::new(),
                 };
 
                 if options.signatures {
-                    if let Some(sig) = (spec.get_signature)(child, source) {
-                        symbol.signature = Some(if sig.len() > 120 {
-                            let mut s = sig[..117].to_string();
-                            s.push_str("...");
-                            s
-                        } else {
-                            sig
-                        });
-                    }
+                    symbol.signature =
+                        (spec.get_signature)(child, source).map(|s| truncate_display(&s, 120));
                 }
 
                 // Extract children from container types
@@ -1245,20 +1369,14 @@ fn walk_node(
                         let mut symbol = SymbolInfo {
                             name,
                             kind,
-                            start_line: child.start_position().row + 1,
-                            end_line: child.end_position().row + 1,
+                            start_line: line_range(child).0,
+                            end_line: line_range(child).1,
                             signature: None,
                             children: Vec::new(),
                         };
                         if options.signatures {
                             symbol.signature = (spec.get_signature)(decl, source)
-                                .map(|s| {
-                                    if s.len() > 120 {
-                                        format!("{}...", &s[..117])
-                                    } else {
-                                        s
-                                    }
-                                });
+                                .map(|s| truncate_display(&s, 120));
                         }
                         if !options.top_level_only && (spec.is_container)(decl.kind()) {
                             walk_node(
@@ -1286,20 +1404,14 @@ fn walk_node(
                         let mut symbol = SymbolInfo {
                             name,
                             kind: def_kind,
-                            start_line: child.start_position().row + 1,
-                            end_line: child.end_position().row + 1,
+                            start_line: line_range(child).0,
+                            end_line: line_range(child).1,
                             signature: None,
                             children: Vec::new(),
                         };
                         if options.signatures {
                             symbol.signature = (spec.get_signature)(child, source)
-                                .map(|s| {
-                                    if s.len() > 120 {
-                                        format!("{}...", &s[..117])
-                                    } else {
-                                        s
-                                    }
-                                });
+                                .map(|s| truncate_display(&s, 120));
                         }
                         if !options.top_level_only && (spec.is_container)(def.kind()) {
                             walk_node(
@@ -1319,8 +1431,9 @@ fn walk_node(
             }
         }
 
-        // Recurse into non-symbol nodes
-        if (spec.node_kind)(child.kind()).is_none() {
+        // Recurse into non-symbol nodes. A Markdown section with no heading is
+        // not a symbol but still holds the headed sections after it.
+        if (spec.node_kind)(child.kind()).is_none() || grammar == "markdown" {
             walk_node(child, spec, grammar, source, results, options, depth);
         }
     }
@@ -1454,91 +1567,4 @@ pub fn count_symbols(symbols: &[SymbolInfo]) -> usize {
         count += count_symbols(&sym.children);
     }
     count
-}
-
-// ─── Find identifiers ─────────────────────────────────────────────────
-
-/// Node types that represent identifiers across grammars.
-static IDENTIFIER_TYPES: &[&str] = &[
-    "identifier",
-    "type_identifier",
-    "property_identifier",
-    "shorthand_property_identifier",
-    "shorthand_property_identifier_pattern",
-    "field_identifier",
-    "scoped_identifier",
-    "package_identifier",
-    "attribute",
-    "simple_identifier",
-    "name",
-    "qualified_name",
-    "constant",
-    "symbol",
-];
-
-pub struct IdentifierMatch {
-    pub file: String,
-    pub line: usize,
-    pub col: usize,
-    pub line_text: String,
-    pub source_lines: Vec<String>,
-}
-
-/// Find all occurrences of an identifier name in a parsed tree.
-pub fn find_identifiers_in_tree(
-    tree: &Tree,
-    name: &str,
-    source: &str,
-    file_path: &str,
-) -> Vec<IdentifierMatch> {
-    let source_bytes = source.as_bytes();
-    let source_lines: Vec<String> = source.lines().map(|l| l.to_string()).collect();
-    let id_types: HashSet<&str> = IDENTIFIER_TYPES.iter().copied().collect();
-    let mut matches = Vec::new();
-
-    fn walk<'a>(
-        node: Node<'a>,
-        name: &str,
-        source: &[u8],
-        source_lines: &[String],
-        file_path: &str,
-        id_types: &HashSet<&str>,
-        matches: &mut Vec<IdentifierMatch>,
-    ) {
-        if id_types.contains(node.kind()) {
-            if let Ok(text) = node.utf8_text(source) {
-                if text == name {
-                    let line = node.start_position().row;
-                    matches.push(IdentifierMatch {
-                        file: file_path.to_string(),
-                        line: line + 1,
-                        col: node.start_position().column + 1,
-                        line_text: source_lines
-                            .get(line)
-                            .map(|l| l.trim_end().to_string())
-                            .unwrap_or_default(),
-                        source_lines: source_lines.to_vec(),
-                    });
-                }
-            }
-        }
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.is_named() {
-                    walk(child, name, source, source_lines, file_path, id_types, matches);
-                }
-            }
-        }
-    }
-
-    walk(
-        tree.root_node(),
-        name,
-        source_bytes,
-        &source_lines,
-        file_path,
-        &id_types,
-        &mut matches,
-    );
-    matches
 }

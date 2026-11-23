@@ -72,6 +72,10 @@ static EXTENSION_MAP: &[(&str, LanguageInfo)] = &[
     (".hcl", LanguageInfo { grammar: "hcl", name: "HCL" }),
     (".tf", LanguageInfo { grammar: "terraform", name: "Terraform" }),
     (".tfvars", LanguageInfo { grammar: "terraform", name: "Terraform" }),
+    // Markdown
+    (".md", LanguageInfo { grammar: "markdown", name: "Markdown" }),
+    (".markdown", LanguageInfo { grammar: "markdown", name: "Markdown" }),
+    (".mdx", LanguageInfo { grammar: "markdown", name: "MDX" }),
 ];
 
 /// Get language info for a file extension (including the dot).
@@ -115,6 +119,8 @@ pub fn load_language(grammar: &str) -> Option<Language> {
         "proto" => Some(tree_sitter_proto::LANGUAGE.into()),
         "hcl" => Some(tree_sitter_hcl::LANGUAGE.into()),
         "terraform" => Some(tree_sitter_hcl::LANGUAGE.into()),
+        // Block grammar only: sections and headings, not inline spans.
+        "markdown" => Some(tree_sitter_md::LANGUAGE.into()),
         _ => None,
     }
 }

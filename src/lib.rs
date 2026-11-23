@@ -1,6 +1,7 @@
 pub mod languages;
 pub mod parser;
 pub mod symbols;
+pub mod nav;
 pub mod walker;
 pub mod hasher;
 pub mod chunker;
