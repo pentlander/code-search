@@ -44,9 +44,12 @@ pub struct NomicBertConfig {
     pub mlp_fc2_bias: bool,
     #[serde(default)]
     pub prenorm: bool,
+    #[serde(default = "default_type_vocab_size")]
+    pub type_vocab_size: i32,
 }
 
 fn default_n_inner() -> Option<i32> { None }
+fn default_type_vocab_size() -> i32 { 2 }
 fn default_layer_norm_eps() -> f32 { 1e-12 }
 fn default_rotary_base() -> f32 { 10000.0 }
 fn default_rotary_fraction() -> f32 { 1.0 }
@@ -57,6 +60,11 @@ fn default_rotary_fraction() -> f32 { 1.0 }
 pub struct NomicEmbeddings {
     #[param]
     pub word_embeddings: Embedding,
+    /// Segment embeddings. CodeRankEmbed always uses segment 0, but the
+    /// reference NomicBert still adds this row, and strict safetensors
+    /// loading (mlx-rs >= 0.34) requires every tensor in the file to be declared.
+    #[param]
+    pub token_type_embeddings: Embedding,
 }
 
 #[derive(Debug, ModuleParameters)]
@@ -123,6 +131,7 @@ impl NomicBertModel {
         Ok(Self {
             embeddings: NomicEmbeddings {
                 word_embeddings: Embedding::new(config.vocab_size, hidden)?,
+                token_type_embeddings: Embedding::new(config.type_vocab_size, hidden)?,
             },
             emb_ln: nn::LayerNormBuilder::new(hidden)
                 .eps(config.layer_norm_epsilon)
@@ -137,6 +146,10 @@ impl NomicBertModel {
         attention_mask: Option<&Array>,
     ) -> Result<Array, Exception> {
         let mut x = self.embeddings.word_embeddings.forward(input_ids)?;
+        // Reference NomicBert: embeddings = word + token_type(zeros).
+        let token_type_ids = Array::zeros::<i32>(input_ids.shape())?;
+        let segment = self.embeddings.token_type_embeddings.forward(&token_type_ids)?;
+        x = x.add(&segment)?;
         x = self.emb_ln.forward(&x)?;
 
         let mask = if let Some(am) = attention_mask {
@@ -215,7 +228,7 @@ impl NomicAttention {
         let hidden = self.num_heads * self.head_dim;
 
         let qkv = self.Wqkv.forward(x)?;
-        let parts = qkv.split(3, -1)?;
+        let parts = qkv.split_equal(3, -1)?;
         let q = parts[0]
             .reshape(&[b, l, self.num_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;

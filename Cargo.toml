@@ -31,8 +31,8 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-hcl = "1"
 
 # MLX GPU embedding
-mlx-rs = { git = "https://github.com/oxideai/mlx-rs", rev = "fc41a8fa" }
-mlx-macros = { git = "https://github.com/oxideai/mlx-rs", rev = "fc41a8fa" }
+mlx-rs = { version = "0.34", features = ["metal-jit"] }
+mlx-macros = "0.34"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 # SQLite + vector search
