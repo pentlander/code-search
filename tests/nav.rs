@@ -51,6 +51,53 @@ fn scope_outside_every_symbol_is_file_scope() {
 }
 
 #[test]
+fn whole_line_lookups_see_symbols_behind_leading_wrappers() {
+    // The first token is `export` or a YAML `-`, which holds the symbol as a
+    // child rather than sitting inside it.
+    let ts = "export interface Base { id: string }\nexport function run() {\n  return 1;\n}\n";
+    let tree = parse("typescript", ts);
+    assert_eq!(
+        nav::scope(&tree, "typescript", ts, 1, None, false).unwrap(),
+        "L1 scope:\nBase (iface L1)"
+    );
+    assert_eq!(
+        nav::scope(&tree, "typescript", ts, 2, None, false).unwrap(),
+        "L2 scope:\nrun (fn L2-L4)"
+    );
+    // An explicit column still means the node under it.
+    assert_eq!(
+        nav::scope(&tree, "typescript", ts, 2, Some(1), false).unwrap(),
+        "L2:1 scope:\nrun (fn L2-L4)"
+    );
+    let py = "@cache\ndef load():\n    return 1\n";
+    let tree = parse("python", py);
+    assert_eq!(
+        nav::scope(&tree, "python", py, 1, Some(2), false).unwrap(),
+        "L1:2 scope:\nload (fn L1-L3)"
+    );
+    let yaml = "tasks:\n  - name: build\n    run: make\n";
+    let tree = parse("yaml", yaml);
+    let out = nav::scope(&tree, "yaml", yaml, 2, None, false).unwrap();
+    assert!(out.ends_with("name (prop L2)"), "{}", out);
+    let keyed = "fe80::/10: local\n";
+    let tree = parse("yaml", keyed);
+    let out = nav::inspect(
+        &tree,
+        "yaml",
+        keyed,
+        "k.yaml",
+        InspectTarget::Symbol("fe80::/10"),
+        &InspectOptions {
+            depth: 3,
+            include: Categories::all(),
+            signatures: false,
+        },
+    )
+    .unwrap();
+    assert!(out.starts_with("fe80::/10 (prop L1)"), "{}", out);
+}
+
+#[test]
 fn inspect_lists_only_included_categories_under_the_target() {
     let tree = parse("typescript", BOX_TS);
     let calls = Categories::parse("calls").unwrap();
@@ -165,6 +212,23 @@ fn inspect_errors_name_the_problem() {
         },
     );
     assert_eq!(missing.unwrap_err(), "No symbol named \"nope\" in a.ts");
+    // A leading module segment naming the file itself is dropped.
+    let prefixed = nav::inspect(
+        &tree,
+        "typescript",
+        src,
+        "src/a.ts",
+        InspectTarget::Symbol("crate::a::nope"),
+        &InspectOptions {
+            depth: 3,
+            include: Categories::all(),
+            signatures: false,
+        },
+    );
+    assert_eq!(
+        prefixed.unwrap_err(),
+        "No symbol named \"crate::a::nope\" in src/a.ts"
+    );
     let ambiguous = nav::inspect(
         &tree,
         "typescript",
@@ -189,7 +253,7 @@ fn inspect_errors_name_the_problem() {
         "typescript",
         src,
         "a.ts",
-        InspectTarget::Symbol("B::run"),
+        InspectTarget::Symbol("a::B::run"),
         &InspectOptions {
             depth: 3,
             include: Categories::all(),
@@ -210,6 +274,20 @@ fn markdown_sections_nest_and_stop_before_the_next_heading() {
     assert_eq!(
         outline("markdown", single),
         "No symbols found in this title (section L1-L2)"
+    );
+}
+
+#[test]
+fn outline_depth_zero_keeps_only_top_level_symbols() {
+    let src = "# Title\n\n## Details\n\n# Next\n";
+    let tree = parse("markdown", src);
+    let opts = ExtractOptions {
+        max_depth: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(
+        format_outline(&extract_symbols(&tree, "markdown", src, &opts), false),
+        "Title (section L1-L4)\nNext (section L5)"
     );
 }
 
@@ -304,5 +382,45 @@ fn python_and_rust_roles() {
             (2, Read, s("count")),
             (3, Call, s("count")),
         ]
+    );
+}
+
+#[test]
+fn elixir_modules_nest_defs_and_bind_parameters() {
+    let src = "defmodule Shop.Cart do\n  def add(cart, item) when is_map(item) do\n    Map.put(cart, item.id, item)\n  end\n  def empty, do: %{}\nend\n";
+    assert_eq!(
+        outline("elixir", src),
+        "Shop.Cart (mod L1-L6)\n├── add (fn L2-L4)\n└── empty (fn L5)"
+    );
+    let tree = parse("elixir", src);
+    let out = nav::inspect(
+        &tree,
+        "elixir",
+        src,
+        "cart.ex",
+        InspectTarget::Symbol("Cart.add"),
+        &InspectOptions {
+            depth: 3,
+            include: Categories::parse("calls").unwrap(),
+            signatures: false,
+        },
+    )
+    .unwrap();
+    assert!(out.starts_with("Shop.Cart::add (fn L2-L4)"), "{}", out);
+    use Role::*;
+    assert_eq!(
+        roles("elixir", src, "cart"),
+        vec![
+            (2, Declaration, s("Shop.Cart::add")),
+            (3, Read, s("Shop.Cart::add"))
+        ]
+    );
+    assert_eq!(
+        roles("elixir", src, "add"),
+        vec![(2, Declaration, s("Shop.Cart"))]
+    );
+    assert_eq!(
+        roles("elixir", src, "empty"),
+        vec![(5, Declaration, s("Shop.Cart"))]
     );
 }

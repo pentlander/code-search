@@ -146,7 +146,7 @@ struct LanguageSpec {
     node_kind: fn(&str) -> Option<SymbolKind>,
     get_name: for<'a> fn(Node<'a>, SymbolKind, &[u8]) -> Option<String>,
     get_signature: for<'a> fn(Node<'a>, &[u8]) -> Option<String>,
-    resolve_kind: for<'a> fn(Node<'a>, SymbolKind) -> SymbolKind,
+    resolve_kind: for<'a> fn(Node<'a>, SymbolKind, &[u8]) -> SymbolKind,
     is_container: fn(&str) -> bool,
 }
 
@@ -247,7 +247,7 @@ pub fn node_symbol<'a>(node: Node<'a>, grammar: &str, source: &[u8]) -> Option<N
         return None;
     }
     let raw = (spec.node_kind)(node.kind())?;
-    let kind = (spec.resolve_kind)(node, raw);
+    let kind = (spec.resolve_kind)(node, raw, source);
     let name = truncate_display(&(spec.get_name)(node, kind, source)?, 80);
     let kind = if grammar == "hcl" || grammar == "terraform" {
         map_hcl_kind(kind, &name)
@@ -276,19 +276,20 @@ pub fn node_signature(node: Node, grammar: &str, source: &[u8]) -> Option<String
 
 /// The node whose range the outline reports for a symbol node.
 fn range_owner(node: Node) -> Node {
-    if let Some(parent) = node.parent() {
-        let wraps = match parent.kind() {
-            "export_statement" | "export_declaration" => {
-                parent.child_by_field_name("declaration") == Some(node)
-            }
-            "decorated_definition" => parent.child_by_field_name("definition") == Some(node),
-            _ => false,
-        };
-        if wraps {
-            return parent;
-        }
+    match node.parent() {
+        Some(parent) if wrapped_declaration(parent) == Some(node) => parent,
+        _ => node,
     }
-    node
+}
+
+/// The declaration an `export` statement or decorated definition wraps; the
+/// wrapper's range is that symbol's range.
+pub fn wrapped_declaration(node: Node) -> Option<Node> {
+    match node.kind() {
+        "export_statement" | "export_declaration" => node.child_by_field_name("declaration"),
+        "decorated_definition" => node.child_by_field_name("definition"),
+        _ => None,
+    }
 }
 
 fn is_inside_class(node: Node) -> bool {
@@ -421,7 +422,7 @@ static TYPESCRIPT_SPEC: LanguageSpec = LanguageSpec {
     node_kind: ts_node_kind,
     get_name: ts_get_name,
     get_signature: ts_get_signature,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: ts_is_container,
 };
 
@@ -439,7 +440,7 @@ static JAVASCRIPT_SPEC: LanguageSpec = LanguageSpec {
     node_kind: js_node_kind,
     get_name: ts_get_name,
     get_signature: ts_get_signature,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| t == "class_declaration",
 };
 
@@ -462,7 +463,7 @@ fn py_get_name(node: Node, _kind: SymbolKind, source: &[u8]) -> Option<String> {
     field_name(node, "name", source)
 }
 
-fn py_resolve_kind(node: Node, kind: SymbolKind) -> SymbolKind {
+fn py_resolve_kind(node: Node, kind: SymbolKind, _source: &[u8]) -> SymbolKind {
     if node.kind() == "decorated_definition" {
         if let Some(def) = node.child_by_field_name("definition") {
             if def.kind() == "class_definition" {
@@ -560,7 +561,7 @@ static RUST_SPEC: LanguageSpec = LanguageSpec {
     node_kind: rust_node_kind,
     get_name: rust_get_name,
     get_signature: rust_get_signature,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: rust_is_container,
 };
 
@@ -583,7 +584,7 @@ fn go_get_name(node: Node, _kind: SymbolKind, source: &[u8]) -> Option<String> {
     field_name(node, "name", source)
 }
 
-fn go_resolve_kind(node: Node, kind: SymbolKind) -> SymbolKind {
+fn go_resolve_kind(node: Node, kind: SymbolKind, _source: &[u8]) -> SymbolKind {
     if node.kind() == "type_declaration" {
         if let Some(spec) = first_child_of_type(node, "type_spec") {
             if let Some(value) = spec.child_by_field_name("type") {
@@ -662,7 +663,7 @@ static JAVA_SPEC: LanguageSpec = LanguageSpec {
     node_kind: java_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: java_get_signature,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: java_is_container,
 };
 
@@ -695,7 +696,7 @@ static KOTLIN_SPEC: LanguageSpec = LanguageSpec {
     node_kind: kotlin_node_kind,
     get_name: kotlin_get_name,
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: kotlin_is_container,
 };
 
@@ -714,7 +715,7 @@ static RUBY_SPEC: LanguageSpec = LanguageSpec {
     node_kind: ruby_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| matches!(t, "class" | "module"),
 };
 
@@ -747,7 +748,7 @@ static SWIFT_SPEC: LanguageSpec = LanguageSpec {
     node_kind: swift_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: swift_is_container,
 };
 
@@ -783,7 +784,7 @@ static CSHARP_SPEC: LanguageSpec = LanguageSpec {
         let name = field_name(node, "name", source)?;
         build_signature(&name, node, source)
     },
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: csharp_is_container,
 };
 
@@ -800,7 +801,7 @@ static LUA_SPEC: LanguageSpec = LanguageSpec {
     node_kind: lua_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |_| false,
 };
 
@@ -817,7 +818,7 @@ static BASH_SPEC: LanguageSpec = LanguageSpec {
     node_kind: bash_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: |_, _| None,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |_| false,
 };
 
@@ -844,7 +845,7 @@ static SCALA_SPEC: LanguageSpec = LanguageSpec {
     node_kind: scala_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: scala_is_container,
 };
 
@@ -880,7 +881,7 @@ static PHP_SPEC: LanguageSpec = LanguageSpec {
         let name = field_name(node, "name", source)?;
         build_signature(&name, node, source)
     },
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: php_is_container,
 };
 
@@ -903,7 +904,7 @@ static ZIG_SPEC: LanguageSpec = LanguageSpec {
     node_kind: zig_node_kind,
     get_name: zig_get_name,
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |_| false,
 };
 
@@ -916,33 +917,58 @@ fn elixir_node_kind(node_type: &str) -> Option<SymbolKind> {
     }
 }
 
+const ELIXIR_MODULE_DEFS: &[&str] = &["defmodule", "defprotocol", "defimpl"];
+const ELIXIR_FN_DEFS: &[&str] = &["def", "defp", "defmacro", "defmacrop", "defguard", "defguardp"];
+
+/// `def`, `defmodule` and friends are ordinary calls; their target names them.
+fn elixir_definer<'a>(node: Node, source: &'a [u8]) -> Option<&'a str> {
+    let target = node.child_by_field_name("target")?;
+    let text = std::str::from_utf8(&source[target.byte_range()]).ok()?;
+    (ELIXIR_MODULE_DEFS.contains(&text) || ELIXIR_FN_DEFS.contains(&text)).then_some(text)
+}
+
+/// True for a `def`/`defp`/`defmacro`-style call that defines a function.
+pub fn elixir_defines_function(node: Node, source: &[u8]) -> bool {
+    elixir_definer(node, source).is_some_and(|d| ELIXIR_FN_DEFS.contains(&d))
+}
+
+fn elixir_resolve_kind(node: Node, kind: SymbolKind, source: &[u8]) -> SymbolKind {
+    match elixir_definer(node, source) {
+        Some(d) if ELIXIR_MODULE_DEFS.contains(&d) => SymbolKind::Module,
+        _ => kind,
+    }
+}
+
 fn elixir_get_name(node: Node, _kind: SymbolKind, source: &[u8]) -> Option<String> {
-    let target = first_child_of_type(node, "identifier")?;
-    let name = node_text(target, source);
-    if !["def", "defp", "defmodule", "defprotocol", "defimpl", "defmacro"].contains(&name) {
-        return None;
-    }
-    let args = node.child_by_field_name("arguments")?;
-    let first_arg = args.child(0)?;
-    if name == "defmodule" {
+    let definer = elixir_definer(node, source)?;
+    // `arguments` is a child node here, not a field.
+    let first_arg = first_child_of_type(node, "arguments")?.named_child(0)?;
+    if ELIXIR_MODULE_DEFS.contains(&definer) {
         return Some(node_text(first_arg, source).to_string());
     }
-    if first_arg.kind() == "call" {
-        return first_child_of_type(first_arg, "identifier")
-            .map(|n| node_text(n, source).to_string());
+    // `def name(args) when guard` wraps the head in a `when` operator.
+    let head = if first_arg.kind() == "binary_operator" {
+        first_arg.child_by_field_name("left")?
+    } else {
+        first_arg
+    };
+    match head.kind() {
+        "call" => head
+            .child_by_field_name("target")
+            .map(|n| node_text(n, source).to_string()),
+        "identifier" => Some(node_text(head, source).to_string()),
+        _ => None,
     }
-    if first_arg.kind() == "identifier" {
-        return Some(node_text(first_arg, source).to_string());
-    }
-    None
 }
 
 static ELIXIR_SPEC: LanguageSpec = LanguageSpec {
     node_kind: elixir_node_kind,
     get_name: elixir_get_name,
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
-    is_container: |_| false,
+    resolve_kind: elixir_resolve_kind,
+    // Only definer calls become symbols, so recursing into calls finds the
+    // defs inside a module's do block.
+    is_container: |kind| kind == "call",
 };
 
 // ─── Dart ──────────────────────────────────────────────────────────────
@@ -970,7 +996,7 @@ static DART_SPEC: LanguageSpec = LanguageSpec {
     node_kind: dart_node_kind,
     get_name: |node, _, source| field_name(node, "name", source),
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: dart_is_container,
 };
 
@@ -1001,7 +1027,7 @@ static OCAML_SPEC: LanguageSpec = LanguageSpec {
     node_kind: ocaml_node_kind,
     get_name: ocaml_get_name,
     get_signature: |node, source| extract_signature_line(node, source),
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: ocaml_is_container,
 };
 
@@ -1021,7 +1047,7 @@ static YAML_SPEC: LanguageSpec = LanguageSpec {
             .map(|n| node_text(n, source).to_string())
     },
     get_signature: |_, _| None,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| t == "block_mapping_pair",
 };
 
@@ -1060,7 +1086,7 @@ static TOML_SPEC: LanguageSpec = LanguageSpec {
     node_kind: toml_node_kind,
     get_name: toml_get_name,
     get_signature: |_, _| None,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| matches!(t, "table" | "table_array_element"),
 };
 
@@ -1128,7 +1154,7 @@ static PROTO_SPEC: LanguageSpec = LanguageSpec {
     node_kind: proto_node_kind,
     get_name: proto_get_name,
     get_signature: proto_get_signature,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: proto_is_container,
 };
 
@@ -1184,7 +1210,7 @@ static HCL_SPEC: LanguageSpec = LanguageSpec {
     node_kind: hcl_node_kind,
     get_name: hcl_get_name,
     get_signature: |_, _| None,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| t == "block",
 };
 
@@ -1192,7 +1218,7 @@ static TERRAFORM_SPEC: LanguageSpec = LanguageSpec {
     node_kind: hcl_node_kind,
     get_name: hcl_get_name,
     get_signature: |_, _| None,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| t == "block",
 };
 
@@ -1231,7 +1257,7 @@ static MARKDOWN_SPEC: LanguageSpec = LanguageSpec {
     node_kind: markdown_node_kind,
     get_name: markdown_get_name,
     get_signature: |_, _| None,
-    resolve_kind: |_, kind| kind,
+    resolve_kind: |_, kind, _| kind,
     is_container: |t| t == "section",
 };
 
@@ -1303,7 +1329,7 @@ fn walk_node(
         }
 
         if let Some(raw_kind) = (spec.node_kind)(child.kind()) {
-            let kind = (spec.resolve_kind)(child, raw_kind);
+            let kind = (spec.resolve_kind)(child, raw_kind, source);
             if let Some(name) = (spec.get_name)(child, kind, source) {
                 let name = truncate_display(&name, 80);
 

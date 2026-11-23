@@ -99,7 +99,8 @@ enum Commands {
         #[arg(long, conflicts_with = "line")]
         symbol: Option<String>,
 
-        /// Inspect: maximum nesting depth of reported items
+        /// Inspect: maximum nesting depth of reported items (default 3).
+        /// Outline/symbols: maximum symbol nesting depth, 0 = top level only
         #[arg(long)]
         depth: Option<usize>,
 
@@ -372,16 +373,6 @@ struct NavArgs<'a> {
     include: Option<&'a str>,
 }
 
-impl NavArgs<'_> {
-    fn any(&self) -> bool {
-        self.line.is_some()
-            || self.column.is_some()
-            || self.symbol.is_some()
-            || self.depth.is_some()
-            || self.include.is_some()
-    }
-}
-
 fn cmd_symbols(
     path: &str,
     action: &str,
@@ -400,10 +391,13 @@ fn cmd_symbols(
         }
         return cmd_navigate(path, &abs_path, action, signatures, &nav_args);
     }
-    if nav_args.any() {
+    if nav_args.line.is_some()
+        || nav_args.column.is_some()
+        || nav_args.symbol.is_some()
+        || nav_args.include.is_some()
+    {
         return Err(
-            "--line, --column, --symbol, --depth and --include apply only to inspect and scope"
-                .to_string(),
+            "--line, --column, --symbol and --include apply only to inspect and scope".to_string(),
         );
     }
 
@@ -428,7 +422,7 @@ fn cmd_symbols(
                         kind: kind.map(|s| s.to_string()),
                         name_pattern: name_pattern.map(|s| s.to_string()),
                         top_level_only: true,
-                        max_depth: Some(2),
+                        max_depth: Some(nav_args.depth.unwrap_or(2)),
                     };
 
                     let syms = extract_symbols(
@@ -480,6 +474,7 @@ fn cmd_symbols(
             signatures,
             kind: kind.map(|s| s.to_string()),
             name_pattern: name_pattern.map(|s| s.to_string()),
+            max_depth: nav_args.depth,
             ..Default::default()
         };
 

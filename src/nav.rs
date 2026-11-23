@@ -12,8 +12,8 @@
 use tree_sitter::{Node, Point, Tree};
 
 use crate::symbols::{
-    format_outline, line_range, node_signature, node_symbol, truncate_display, NodeSymbol,
-    SymbolInfo,
+    elixir_defines_function, format_outline, line_range, node_signature, node_symbol,
+    truncate_display, wrapped_declaration, NodeSymbol, SymbolInfo,
 };
 
 // ─── Shared helpers ────────────────────────────────────────────────────
@@ -21,11 +21,16 @@ use crate::symbols::{
 /// Symbols enclosing `node` (inclusive), outermost first.
 fn enclosing_symbols<'a>(node: Node<'a>, grammar: &str, source: &[u8]) -> Vec<NodeSymbol<'a>> {
     let mut chain = Vec::new();
+    let mut came_from = None;
     let mut current = Some(node);
     while let Some(n) = current {
         if let Some(sym) = node_symbol(n, grammar, source) {
             chain.push(sym);
+        } else if let Some(decl) = wrapped_declaration(n).filter(|&d| Some(d) != came_from) {
+            // On `export` or a decorator: inside the wrapped symbol's range.
+            chain.extend(node_symbol(decl, grammar, source));
         }
+        came_from = Some(n);
         current = n.parent();
     }
     chain.reverse();
@@ -133,6 +138,51 @@ fn node_at<'a>(tree: &'a Tree, point: Point) -> Node<'a> {
         .unwrap_or(root)
 }
 
+/// The node whose enclosing symbols answer for `point`. With an explicit
+/// column that is the node under it. For a whole line, the first non-blank
+/// token is often a wrapper that holds the symbol as a child (`export`, a
+/// YAML `-`, a Swift attribute), so prefer the first symbol starting on the
+/// line inside the widest node that starts at that token.
+fn anchor_at<'a>(
+    tree: &'a Tree,
+    grammar: &str,
+    source: &[u8],
+    point: Point,
+    whole_line: bool,
+) -> Node<'a> {
+    let node = node_at(tree, point);
+    if !whole_line {
+        return node;
+    }
+    let mut widest = node;
+    while let Some(parent) = widest.parent() {
+        if parent.start_position() != point {
+            break;
+        }
+        widest = parent;
+    }
+    first_symbol_on_row(widest, grammar, source, point.row).unwrap_or(node)
+}
+
+fn first_symbol_on_row<'a>(
+    node: Node<'a>,
+    grammar: &str,
+    source: &[u8],
+    row: usize,
+) -> Option<Node<'a>> {
+    if node.start_position().row > row || node.end_position().row < row {
+        return None;
+    }
+    if node.start_position().row == row && node_symbol(node, grammar, source).is_some() {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node<'a>> = node.children(&mut cursor).collect();
+    children
+        .into_iter()
+        .find_map(|child| first_symbol_on_row(child, grammar, source, row))
+}
+
 fn symbol_info(
     sym: &NodeSymbol,
     display: String,
@@ -177,7 +227,8 @@ pub fn scope(
     let point = point_for(source, line, column)?;
     let at = location_label(line, column);
     let bytes = source.as_bytes();
-    let chain = enclosing_symbols(node_at(tree, point), grammar, bytes);
+    let anchor = anchor_at(tree, grammar, bytes, point, column.is_none());
+    let chain = enclosing_symbols(anchor, grammar, bytes);
     if chain.is_empty() {
         return Ok(format!("{}: file scope", at));
     }
@@ -306,7 +357,8 @@ pub fn inspect(
     let (sym, names) = match target {
         InspectTarget::Line { line, column } => {
             let point = point_for(source, line, column)?;
-            let chain = enclosing_symbols(node_at(tree, point), grammar, bytes);
+            let anchor = anchor_at(tree, grammar, bytes, point, column.is_none());
+            let chain = enclosing_symbols(anchor, grammar, bytes);
             if chain.is_empty() {
                 return Err(format!(
                     "No symbol encloses {} of {}; use scope or outline",
@@ -385,7 +437,7 @@ fn resolve_symbol<'a>(
         }
     }
 
-    let by = |separator: &str| -> Vec<usize> {
+    let by = |query: &str, separator: &str| -> Vec<usize> {
         let segments: Vec<&str> = query.split(separator).filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
             return Vec::new();
@@ -403,9 +455,45 @@ fn resolve_symbol<'a>(
             .map(|(i, _)| i)
             .collect()
     };
-    let mut matches = by("::");
-    if matches.is_empty() && query.contains('.') {
-        matches = by(".");
+    // Whole-string suffix match, for names that contain a separator
+    // themselves (Elixir `Shop.Cart`).
+    let joined = |query: &str| -> Vec<usize> {
+        (0..found.len())
+            .filter(|&i| {
+                ["::", "."].iter().any(|sep| {
+                    let full = found[i].1.join(sep);
+                    full == query || full.ends_with(&format!("{}{}", sep, query))
+                })
+            })
+            .collect()
+    };
+    let lookup = |query: &str| {
+        let mut matches = by(query, "::");
+        if matches.is_empty() && query.contains('.') {
+            matches = by(query, ".");
+        }
+        if matches.is_empty() {
+            matches = joined(query);
+        }
+        matches
+    };
+    let asked = query;
+    // A name that itself contains `::` or `.` (a YAML key like `fe80::/10`)
+    // matches whole before the query is split into segments.
+    let mut matches: Vec<usize> = (0..found.len())
+        .filter(|&i| found[i].1.last().is_some_and(|name| name == query))
+        .collect();
+    if matches.is_empty() {
+        matches = lookup(query);
+    }
+    let mut query = query.to_string();
+    if matches.is_empty() {
+        // `nav::inspect` or `crate::nav::inspect`: leading segments may name
+        // the file's module rather than a symbol inside it.
+        if let Some(rest) = strip_module_prefix(&query, file_label) {
+            matches = lookup(&rest);
+            query = rest;
+        }
     }
     if matches.len() > 1 {
         // A query naming the full path wins over suffix matches.
@@ -419,7 +507,7 @@ fn resolve_symbol<'a>(
         }
     }
     match matches.len() {
-        0 => Err(format!("No symbol named \"{}\" in {}", query, file_label)),
+        0 => Err(format!("No symbol named \"{}\" in {}", asked, file_label)),
         1 => Ok(found.swap_remove(matches[0])),
         _ => {
             let listed: Vec<String> = matches
@@ -444,6 +532,33 @@ fn resolve_symbol<'a>(
             ))
         }
     }
+}
+
+/// Drops leading `crate`/`self`/`super` and file or directory module names from
+/// a qualified query, keeping at least one segment. None when nothing drops.
+fn strip_module_prefix(query: &str, file_label: &str) -> Option<String> {
+    let separator = if query.contains("::") {
+        "::"
+    } else if query.contains('.') {
+        "."
+    } else {
+        return None;
+    };
+    let path = std::path::Path::new(file_label);
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let dir = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str());
+    let is_module = |seg: &str| {
+        matches!(seg, "crate" | "self" | "super") || Some(seg) == stem || Some(seg) == dir
+    };
+    let segments: Vec<&str> = query.split(separator).collect();
+    let skip = segments[..segments.len() - 1]
+        .iter()
+        .take_while(|s| is_module(s))
+        .count();
+    (skip > 0).then(|| segments[skip..].join(separator))
 }
 
 /// `seg` names `name` exactly, names the type of a Rust `impl Trait for Type`,
@@ -880,7 +995,12 @@ fn enclosing_label(node: Node, role: Role, grammar: &str, source: &[u8]) -> Opti
     if role == Role::Declaration {
         if let Some(last) = chain.last() {
             let own_name = node.utf8_text(source).ok() == Some(last.name.as_str());
-            if own_name && is_near_descendant(node, last.node, 2) {
+            let names_it = if grammar == "elixir" {
+                is_elixir_def_name(node, source)
+            } else {
+                is_near_descendant(node, last.node, 2)
+            };
+            if own_name && names_it {
                 chain.pop();
             }
         }
@@ -1006,7 +1126,51 @@ const BINDING_SITES: &[&str] = &[
     "for_expression",
 ];
 
+/// `head` is a function definer's first argument (`name` or `name(params)`),
+/// possibly under a `when` guard.
+fn is_elixir_def_head(head: Node, source: &[u8]) -> bool {
+    let mut up = head.parent();
+    if let Some(op) =
+        up.filter(|p| p.kind() == "binary_operator" && p.child_by_field_name("left") == Some(head))
+    {
+        up = op.parent();
+    }
+    up.filter(|a| a.kind() == "arguments")
+        .and_then(|a| a.parent())
+        .is_some_and(|definer| elixir_defines_function(definer, source))
+}
+
+/// The function name in `def name` or `def name(params)`.
+fn is_elixir_def_name(node: Node, source: &[u8]) -> bool {
+    is_elixir_def_head(node, source)
+        || node.parent().is_some_and(|p| {
+            p.kind() == "call"
+                && p.child_by_field_name("target") == Some(node)
+                && is_elixir_def_head(p, source)
+        })
+}
+
+/// The name or a parameter in the head of `def name(params)`.
+fn is_elixir_binding(node: Node, source: &[u8]) -> bool {
+    if is_elixir_def_name(node, source) {
+        return true;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "arguments" {
+            return parent
+                .parent()
+                .is_some_and(|head| head.kind() == "call" && is_elixir_def_head(head, source));
+        }
+        current = parent;
+    }
+    false
+}
+
 fn is_declaration(node: Node, grammar: &str, source: &[u8]) -> bool {
+    if grammar == "elixir" && is_elixir_binding(node, source) {
+        return true;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };
