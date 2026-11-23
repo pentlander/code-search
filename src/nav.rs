@@ -1305,7 +1305,54 @@ const ASSIGNMENT_KINDS: &[&str] = &[
     "operator_assignment",
 ];
 
+/// The field name in a struct literal: Go `T{f: v}` (not a map literal) or
+/// Rust `T { f: v }`. Initializing a field writes it.
+fn is_field_initializer(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() == "field_initializer" {
+        return field_in_parent(node) == Some("field");
+    }
+    if parent.kind() != "literal_element" || parent.named_child_count() != 1 {
+        return false;
+    }
+    let Some(keyed) = parent.parent().filter(|k| k.kind() == "keyed_element") else {
+        return false;
+    };
+    if keyed.child_by_field_name("key") != Some(parent) {
+        return false;
+    }
+    // Syntax cannot tell a struct key from a map key; the literal's type can.
+    // `[]T{{f: v}}` elides the inner type, so take the outer element type.
+    let mut body = keyed.parent();
+    let mut elided = false;
+    while let Some(literal_value) = body {
+        match literal_value.parent() {
+            Some(c) if c.kind() == "composite_literal" => {
+                let mut ty = c.child_by_field_name("type");
+                if elided {
+                    ty = ty.and_then(|t| {
+                        t.child_by_field_name("element")
+                            .or_else(|| t.child_by_field_name("value"))
+                    });
+                }
+                return ty.is_some_and(|t| t.kind() != "map_type");
+            }
+            Some(e) if e.kind() == "literal_element" => {
+                elided = true;
+                body = e.parent();
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn is_write(node: Node) -> bool {
+    if is_field_initializer(node) {
+        return true;
+    }
     let mut current = node;
     while let Some(parent) = current.parent() {
         let field = field_in_parent(current);

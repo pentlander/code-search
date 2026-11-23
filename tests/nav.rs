@@ -424,3 +424,28 @@ fn elixir_modules_nest_defs_and_bind_parameters() {
         vec![(5, Declaration, s("Shop.Cart"))]
     );
 }
+
+#[test]
+fn struct_literal_fields_are_writes_but_map_keys_are_reads() {
+    use Role::*;
+    let go = "package p\n\nfunc f() {\n\t_ = T{deadline: 1}\n\t_ = map[string]int{deadline: 1}\n\t_ = []T{{deadline: 2}}\n\t_ = &pkg.T{deadline: 3}\n}\n";
+    assert_eq!(
+        roles("go", go, "deadline"),
+        vec![
+            (4, Write, s("f")),
+            (5, Read, s("f")),
+            (6, Write, s("f")),
+            (7, Write, s("f")),
+        ]
+    );
+    let rs =
+        "fn f(deadline: u32) {\n    let t = T { deadline: 1 };\n    let u = T { deadline };\n}\n";
+    assert_eq!(
+        roles("rust", rs, "deadline"),
+        vec![
+            (1, Declaration, s("f")),
+            (2, Write, s("f")),
+            (3, Read, s("f"))
+        ]
+    );
+}
