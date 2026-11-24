@@ -609,6 +609,8 @@ fn cmd_find_idents(
     let mut lines = Vec::new();
     let mut total = 0;
     let mut file_count = 0;
+    // Roles the --role filter hid, so an empty result can say what exists.
+    let mut other_roles: std::collections::BTreeMap<&str, usize> = Default::default();
     for file in &files {
         // Most files cannot contain the name; skip them before parsing.
         if !single_file
@@ -626,11 +628,13 @@ fn cmd_find_idents(
         if parsed.language.grammar == "markdown" {
             continue;
         }
-        let hits: Vec<nav::IdentMatch> =
+        let (hits, others): (Vec<nav::IdentMatch>, Vec<nav::IdentMatch>) =
             nav::find_identifiers(&parsed.tree, parsed.language.grammar, &parsed.source, name)
                 .into_iter()
-                .filter(|m| role.is_none_or(|r| m.role == r))
-                .collect();
+                .partition(|m| role.is_none_or(|r| m.role == r));
+        for m in others {
+            *other_roles.entry(m.role.as_str()).or_default() += 1;
+        }
         if hits.is_empty() {
             continue;
         }
@@ -673,6 +677,18 @@ fn cmd_find_idents(
             "No occurrences of \"{}\"{} found in {}",
             name, role_note, path
         );
+        if !other_roles.is_empty() {
+            let listed: Vec<String> = other_roles
+                .iter()
+                .map(|(r, n)| format!("{} {}", n, r))
+                .collect();
+            println!("Other roles: {}.", listed.join(", "));
+            if role == Some(Role::Write) && other_roles.contains_key("declaration") {
+                println!(
+                    "Initializations such as `x := v`, `let x = v` and `const x = v` count as declarations."
+                );
+            }
+        }
     } else {
         println!("{}", truncate_output(&lines.join("\n")));
         eprintln!(
